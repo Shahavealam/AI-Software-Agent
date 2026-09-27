@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from app.core.config import Settings, configure_logging, get_settings, logger
+from app.core.history import (
+    BaseHistoryStore,
+    ChatMessage,
+    ChatSession,
+    FileHistoryStore,
+    get_history_store,
+    reset_history_store,
+)
 from app.core.llm import LLMGateway
 from app.core.memory import (
     EntityMemory,
@@ -25,8 +33,12 @@ from app.core.state import (
 __all__ = [
     "AgentName",
     "AgentState",
+    "BaseHistoryStore",
+    "ChatMessage",
+    "ChatSession",
     "EntityMemory",
     "EpistemicSummary",
+    "FileHistoryStore",
     "LLMGateway",
     "MemoryManager",
     "Settings",
@@ -39,6 +51,8 @@ __all__ = [
     "VolatileMemory",
     "WorkflowDAG",
     "configure_logging",
+    "get_history_store",
     "get_settings",
     "logger",
+    "reset_history_store",
 ]

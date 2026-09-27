@@ -47,9 +47,13 @@ class ArchitectAgent(BaseAgent):
         await self.tell(emit, "analysing", "Parsing repo structure (AST)", state.session_id)
         repo_map = self._scan_repo()
         patterns = await self.memory.recall(state.goal, k=3)
+        history_block = f"\nSESSION HISTORY:\n{state.history_context[:3000]}" if state.history_context else ""
         plan = await self._gen(
-            f"GOAL: {state.goal}\nREPO MAP (truncated): {str(repo_map)[:4000]}\n"
-            f"RELEVANT PATTERNS: {str(patterns)[:2000]}\nReturn a numbered change plan."
+            f"GOAL: {state.goal}{history_block}\nREPO MAP (truncated): {str(repo_map)[:4000]}\n"
+            f"RELEVANT PATTERNS: {str(patterns)[:2000]}\nReturn a numbered change plan. "
+            "Constraints: Python code must use ONLY the standard library (no flask/django/"
+            "fastapi/requests/numpy — not installed in the sandbox); do NOT plan test "
+            "files (QA generates the suite); list implementation files only."
         )
         state.artifacts["architect/plan.md"] = plan
         await self.memory.entities.update({"last_arch_plan": plan[:2000], "repo_files": len(repo_map)})
@@ -63,8 +67,13 @@ class ArchitectAgent(BaseAgent):
         emit = emit or _noop_emit
         await self.tell(emit, "analysing", "Streaming architectural plan", state.session_id)
         repo_map = self._scan_repo()
+        history_block = f"\nSESSION HISTORY:\n{state.history_context[:3000]}" if state.history_context else ""
         chunks: list[str] = []
-        async for tok in self._gen_stream(f"GOAL: {state.goal}\nREPO FILES: {list(repo_map)[:50]}", emit, state.session_id):
+        async for tok in self._gen_stream(
+            f"GOAL: {state.goal}{history_block}\nREPO FILES: {list(repo_map)[:50]}\n"
+            "Constraints: stdlib-only Python; no test files (QA owns tests).",
+            emit, state.session_id,
+        ):
             chunks.append(tok)
             yield tok
         state.artifacts["architect/plan.md"] = "".join(chunks)
