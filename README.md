@@ -17,6 +17,7 @@ Built on **LangGraph + FastAPI + ChromaDB**, with streaming CLI, HTTP/SSE API, o
 - **Multi-Agent Orchestration**: ProductManager (DAG) → Architect → [Developer → QA → Execution]×N → Writer, with self-correction loop (retry budget, default 3)
 - **Streaming Interfaces**: CLI tokens + SSE (`token` / `state` / `result` events) + Next.js web UI
 - **Persistent Memory**: ChromaDB vector store + JSON entity store + epistemic summarisation
+- **Conversation History**: per-session chat threads (title / rename / delete) backed by MongoDB with JSON-file fallback; follow-up goals reuse `session_id` for "further steps"
 - **Offline Mode**: Fully deterministic fallback when `OPENAI_API_KEY` is empty — no network calls, CI-safe
 
 ## 🗂️ Repository Map
@@ -27,15 +28,15 @@ Agents/
 │   ├── app/                    # NEW multi-agent core (recommended)
 │   │   ├── main.py             # CLI + Python API (arun/arun_stream) + --serve
 │   │   ├── agents/             # product_manager, architect, developer, qa, execution, writer, base, orchestrator
-│   │   ├── core/               # config, llm, memory, state
-│   │   └── api/server.py       # FastAPI app: GET /health, POST /v1/run (SSE) + CORS for :3000/:3001
+│   │   ├── core/               # config, llm, memory, state, history (sessions+messages)
+│   │   └── api/server.py       # FastAPI app: GET /health, POST /v1/run (SSE) + /v1/sessions CRUD + CORS for :3000/:3001
 │   ├── agent_core/             # LEGACY single-agent orchestrator (kept for compat)
 │   ├── main.py                 # LEGACY single-agent CLI (list files | view | status | commit | help | exit)
 │   ├── tools/                  # git / testing / validation helpers
 │   ├── prompts/ templates/     # system + task prompts, code/file templates
-│   ├── tests/                  # test_state, test_orchestrator, test_memory, test_agents
+│   ├── tests/                  # test_state, test_orchestrator, test_memory, test_agents, test_history
 │   ├── frontend/README.md      # spec doc for the web UI (scaffold lives in ../ai_software_web)
-│   └── .agent_state/ .agent_chroma/  # runtime data (entity JSON + chroma persist) — gitignored conceptually
+│   └── .agent_state/ .agent_chroma/  # runtime data (entity JSON + history JSON + chroma persist) — gitignored conceptually
 └── ai_software_web/            # Next.js 14 + MUI v6 frontend (see its own README)
     ├── src/app/                # layout (AppBar+health), page (runner), api/run (CORS proxy)
     ├── src/components/         # GoalForm, StreamView, PipelineView, ArtifactsView, HealthBadge
@@ -89,6 +90,20 @@ cp .env.example .env
 | `VECTOR_BACKEND` | `chroma` | `chroma` or `memory` (in-process fallback) |
 | `CHROMA_PERSIST_DIR` | `.agent_chroma` | Vector store persist path |
 | `ENTITY_STORE_PATH` | `.agent_state/entities.json` | Entity memory path |
+| `MONGODB_URI` | _(empty)_ | Empty = JSON-file history fallback; set e.g. `mongodb://localhost:27017` for MongoDB history |
+| `MONGODB_DB` | `ai_agent` | MongoDB database for history |
+| `MONGODB_SESSIONS_COLLECTION` | `sessions` | Sessions collection name |
+| `MONGODB_MESSAGES_COLLECTION` | `messages` | Messages collection name |
+| `HISTORY_STORE_PATH` | `.agent_state/history.json` | File fallback path when `MONGODB_URI` is empty |
+| `HISTORY_MAX_MESSAGES` | `200` | Max messages kept per session (oldest dropped) |
+| `HISTORY_MESSAGE_MAX_CHARS` | `65536` | Hard cap per persisted message (both backends) |
+| `HISTORY_SUMMARY_MAX_CHARS` | `20000` | Cap for the orchestrator result summary |
+| `HISTORY_STREAM_PREVIEW_MAX_CHARS` | `12000` | Streamed-output preview inside the summary |
+| `HISTORY_REPORT_FIELD_MAX_CHARS` | `4000` | Per-field cap for persisted exec/test reports |
+| `HISTORY_SAVE_AGENT_TURNS` | `true` | Persist each agent's full output as its own message |
+| `HISTORY_AGENT_TURN_MAX_CHARS` | `12000` | Cap per persisted agent-turn message |
+| `HISTORY_ARTIFACT_FILE_MAX_CHARS` | `20000` | Per-file cap for the artifact-contents snapshot |
+| `HISTORY_ARTIFACTS_TOTAL_MAX_CHARS` | `200000` | Total cap for the artifact-contents snapshot |
 | `PROJECT_ROOT` | `.` | Working directory for agent file ops |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `MAX_SELF_CORRECTION_RETRIES` | `3` | Self-correction loop retries (0–10) |
@@ -141,6 +156,7 @@ curl http://localhost:8000/health
 # => {"status":"ok","llm":"offline"}
 
 # Stream an agent run (SSE: token / state / result events)
+# Omit session_id => new auto-titled session; reuse it for follow-up "further steps"
 curl -N -X POST http://localhost:8000/v1/run \
   -H "Content-Type: application/json" \
   -d '{"goal": "Create a Python CLI calculator with tests", "session_id": "demo"}'
@@ -157,23 +173,76 @@ Event shapes:
 { "type": "result", "state": { "artifacts": {...}, "exec_reports": [], "retries_used": 0, "error": null } }
 ```
 
+### 3b. Conversation history (sessions + messages)
+
+Every `POST /v1/run` persists under `session_id` (auto-created + auto-titled from the goal when omitted): the user goal, **each agent's full streamed output** as its own message (`ProductManager`/`Architect`/`Developer`/`Writer` as `note`, QA suite included), and a final `result` message carrying the summary, wider report tails (last 5 exec / 3 test reports) and a bounded **artifact-contents snapshot** (previously only file names were kept). Prior turns are injected into `state.history_context` so ProductManager/Architect/Developer continue the same thread. Backend: MongoDB when `MONGODB_URI` is set, otherwise `.agent_state/history.json` (offline/CI safe). Volume is controlled by the `HISTORY_*_CHARS` settings above (MongoDB documents cap at 16MB); LLM context stays capped separately via `MAX_CONTEXT_TOKENS`.
+
+```bash
+# List sessions (newest first)
+curl "http://localhost:8000/v1/sessions?limit=50&offset=0"
+
+# Create a session explicitly
+curl -X POST http://localhost:8000/v1/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"title": "My calculator thread"}'
+# => {"id": "s-...", "title": "My calculator thread", ...} (201)
+
+# Get session + its messages
+curl http://localhost:8000/v1/sessions/<id>
+
+# Rename title
+curl -X PATCH http://localhost:8000/v1/sessions/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Calculator v2"}'
+
+# List messages only
+curl "http://localhost:8000/v1/sessions/<id>/messages?limit=100"
+
+# Delete session + its messages
+curl -X DELETE http://localhost:8000/v1/sessions/<id>
+```
+
+MongoDB document shapes (`sessions` / `messages` collections, `motor` async driver):
+
+```jsonc
+// sessions: {"_id": "<session_id>", "title": "...", "created_at": 0.0,
+//            "updated_at": 0.0, "message_count": 2, "last_preview": "...", "metadata": {}}
+// messages: {"_id": "<msg_id>", "session_id": "...", "role": "user|assistant|system",
+//            "content": "...", "agent": "Developer", "kind": "goal|result|note", "created_at": 0.0, "extra": {}}
+```
+
 ### 4. Python API
 
 ```python
 import asyncio
 from app.main import arun, arun_stream
 
-# One-shot
-result = asyncio.run(arun("Add unit tests for app/core/memory.py"))
-print(result.artifacts, result.exec_reports)
+# One-shot (pass session_id to continue a thread)
+result = asyncio.run(arun("Add unit tests for app/core/memory.py", session_id="my-thread"))
+print(result.session_id, result.history_context[:200], result.artifacts)
 
 # Streaming
 async def main():
-    async for evt in arun_stream("Scaffold a blog API"):
+    async for evt in arun_stream("Scaffold a blog API", session_id="my-thread"):
         if evt["type"] == "token":
             print(evt["token"], end="")
         elif evt["type"] == "result":
             print("\nDone:", evt["state"]["artifacts"])
+
+asyncio.run(main())
+```
+
+History from Python (same store the API uses):
+
+```python
+import asyncio
+from app.core.history import get_history_store
+
+async def main():
+    store = get_history_store()
+    print(await store.list_sessions())
+    await store.rename_session("<id>", "New title")
+    print(await store.get_messages("<id>"))
 
 asyncio.run(main())
 ```
@@ -202,6 +271,7 @@ pytest -v
 # Focused runs
 pytest tests/test_memory.py -v
 pytest tests/test_orchestrator.py -v
+pytest tests/test_history.py -v
 
 # Lint / format / type-check
 ruff check .
@@ -209,7 +279,7 @@ black .
 mypy app/
 ```
 
-Current suite: `test_state`, `test_orchestrator`, `test_memory` (incl. Chroma keyword-arg round-trip), `test_agents` — all passing.
+Current suite: `test_state`, `test_orchestrator`, `test_memory` (incl. Chroma keyword-arg round-trip), `test_agents`, `test_history` (session CRUD, persistence, orchestrator turn capture, API endpoints) — all passing (26 tests).
 
 ## 🛠️ Troubleshooting
 
@@ -222,6 +292,11 @@ Current suite: `test_state`, `test_orchestrator`, `test_memory` (incl. Chroma ke
 | Frontend shows `backend unreachable` / CORS error on `:3000` | Backend not running, wrong `NEXT_PUBLIC_API_URL` (no trailing `/`), or origin not in `allow_origins`. Start backend (`python -m app.main --serve --port 8000`), or set `NEXT_PUBLIC_API_URL=/api` to use the Next.js proxy route (`src/app/api/run`). |
 | `GET /.well-known/appspecific/com.chrome.devtools.json 404` | Harmless Chrome DevTools probe during `next dev` — not an app error. Ignore, or silence by adding a `public/.well-known/...` stub. |
 | `health: offline` | Normal without `OPENAI_API_KEY`. Set the key in `.env` for online LLM mode. |
+| History empty after restart | Expected before this change; now sessions persist in MongoDB (`MONGODB_URI` set) or `.agent_state/history.json` (fallback). Check the file exists and is writable; same `PermissionError` ownership fix as `entities.json` applies. |
+| `motor is not installed` | Install history backend dep: `pip install motor` (or `pip install -r requirements.txt`). File fallback is used only when `MONGODB_URI` is empty. |
+| `PATCH /v1/sessions/<id>` → 404 | Unknown/expired `session_id` (deleted or different `HISTORY_STORE_PATH` / Mongo DB). List via `GET /v1/sessions` to confirm. |
+| `PATCH /v1/sessions/<id>` → 422 | Empty title — titles must be non-empty (max 200 chars). |
+| `ModuleNotFoundError: No module named 'flask'` (or requests/numpy/…) in exec reports | The sandbox has only the stdlib + already-installed packages — third-party deps can't be pip-installed there. The Developer is instructed stdlib-only, and the failure carries a `missing-dependency` rewrite hint so the retry loop drops the dependency instead of repeating the error. |
 | `CHROMA` lock errors | Only one backend instance per `CHROMA_PERSIST_DIR`; or set `VECTOR_BACKEND=memory` in `.env`. |
 | Stale root-owned pytest tmp (`/private/tmp/pytest-of-root ... not owned`) | Leftover from a sudo test run. `sudo rm -rf /private/tmp/pytest-of-root` and re-run `pytest` without sudo. |
 | Port clash `:3000` / `:8000` | `npm run dev -- -p 3001` / `python -m app.main --serve --port 8001` + update `NEXT_PUBLIC_API_URL`. |

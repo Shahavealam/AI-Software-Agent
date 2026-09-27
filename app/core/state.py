@@ -81,6 +81,7 @@ class AgentState(BaseModel):
 
     session_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     goal: str = ""
+    history_context: str = ""  # prior turns for this session (from HistoryStore)
     dag: WorkflowDAG | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)  # path -> content
     test_reports: list[dict[str, Any]] = Field(default_factory=list)

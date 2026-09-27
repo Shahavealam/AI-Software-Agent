@@ -38,7 +38,7 @@ class ProductManagerAgent(BaseAgent):
         emit = emit or _noop_emit
         await self.tell(emit, "routing", f"Parsing intent: {state.goal[:120]}", state.session_id)
         try:
-            dag = await self._build_dag(state.goal)
+            dag = await self._build_dag(state.goal, state.history_context)
         except Exception as exc:
             logger.warning("router LLM path failed (%s); heuristic fallback", exc)
             dag = self._heuristic_dag(state.goal)
@@ -53,8 +53,9 @@ class ProductManagerAgent(BaseAgent):
         return state
 
     # -- LLM path -----------------------------------------------------
-    async def _build_dag(self, goal: str) -> WorkflowDAG:
-        raw = await self._gen(f"User goal: {goal}\nOwners: Architect, Developer, QA, Execution, Writer.")
+    async def _build_dag(self, goal: str, history_context: str = "") -> WorkflowDAG:
+        history_block = f"\nSESSION HISTORY (prior turns, continue from these):\n{history_context[:3000]}" if history_context else ""
+        raw = await self._gen(f"User goal: {goal}{history_block}\nOwners: Architect, Developer, QA, Execution, Writer.")
         data = self._extract_json(raw)
         tasks = data.get("tasks") if isinstance(data, dict) else None
         if not tasks:

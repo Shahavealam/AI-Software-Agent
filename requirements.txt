@@ -18,6 +18,7 @@ tenacity>=8.5.0
 
 # ── Memory / vector store ───────────────────────────────────────────
 chromadb>=0.5.0
+motor>=3.5.0  # async MongoDB driver (history store; pymongo comes with it)
 # optional qdrant backend:
 # qdrant-client>=1.9.0
 
